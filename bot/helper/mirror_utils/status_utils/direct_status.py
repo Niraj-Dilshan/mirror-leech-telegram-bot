@@ -1,57 +1,51 @@
-#!/usr/bin/env python3
-
-from bot.helper.ext_utils.bot_utils import (MirrorStatus,
-                                            get_readable_file_size,
-                                            get_readable_time)
+from bot.helper.ext_utils.status_utils import (
+    MirrorStatus,
+    get_readable_file_size,
+    get_readable_time,
+)
 
 
 class DirectStatus:
-    def __init__(self, obj, gid, listener):
-        self.__gid = gid
-        self.__listener = listener
-        self.__obj = obj
-        self.__name = self.__obj.name
-        self.message = self.__listener.message
+    def __init__(self, listener, obj, gid):
+        self._gid = gid
+        self._obj = obj
+        self.listener = listener
 
     def gid(self):
-        return self.__gid
-
-    def speed_raw(self):
-        return self.__obj.speed
+        return self._gid
 
     def progress_raw(self):
         try:
-            return self.processed_raw() / self.__obj.total_size * 100
+            return self._obj.processed_bytes / self.listener.size * 100
         except:
             return 0
 
     def progress(self):
-        return f'{round(self.progress_raw(), 2)}%'
+        return f"{round(self.progress_raw(), 2)}%"
 
     def speed(self):
-        return f'{get_readable_file_size(self.speed_raw())}/s'
+        return f"{get_readable_file_size(self._obj.speed)}/s"
 
     def name(self):
-        return self.__name
+        return self.listener.name
 
     def size(self):
-        return get_readable_file_size(self.__obj.total_size)
+        return get_readable_file_size(self.listener.size)
 
     def eta(self):
         try:
-            seconds = (self.__obj.total_size - self.processed_raw()) / self.speed_raw()
+            seconds = (self.listener.size - self._obj.processed_bytes) / self._obj.speed
             return get_readable_time(seconds)
         except:
-            return '-'
+            return "-"
 
     def status(self):
+        if self._obj.download_task and self._obj.download_task.is_waiting:
+            return MirrorStatus.STATUS_QUEUEDL
         return MirrorStatus.STATUS_DOWNLOADING
 
     def processed_bytes(self):
-        return get_readable_file_size(self.processed_raw())
+        return get_readable_file_size(self._obj.processed_bytes)
 
-    def processed_raw(self):
-        return self.__obj.processed_bytes
-
-    def download(self):
-        return self.__obj
+    def task(self):
+        return self._obj
