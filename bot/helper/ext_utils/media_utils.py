@@ -3,13 +3,13 @@ from aiofiles.os import remove, path as aiopath, makedirs
 from asyncio import create_subprocess_exec, gather, wait_for
 from asyncio.subprocess import PIPE
 from os import path as ospath, cpu_count
-from re import search as re_search
+from re import search as re_search, escape
 from time import time
+from aioshutil import rmtree
 
-from bot import LOGGER, subprocess_lock
-from bot.helper.ext_utils.bot_utils import cmd_exec
-from bot.helper.ext_utils.bot_utils import sync_to_async
-from bot.helper.ext_utils.files_utils import ARCH_EXT, get_mime_type
+from bot import LOGGER, subprocess_lock, DOWNLOAD_DIR
+from .bot_utils import cmd_exec, sync_to_async
+from .files_utils import ARCH_EXT, get_mime_type
 
 
 async def convert_video(listener, video_file, ext, retry=False):
@@ -18,6 +18,9 @@ async def convert_video(listener, video_file, ext, retry=False):
     if retry:
         cmd = [
             "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-i",
             video_file,
             "-c:v",
@@ -35,28 +38,45 @@ async def convert_video(listener, video_file, ext, retry=False):
         else:
             cmd[7:7] = ["-c:s", "copy"]
     else:
-        cmd = ["ffmpeg", "-i", video_file, "-map", "0", "-c", "copy", output]
-    if listener.cancelled:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_file,
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            output,
+        ]
+    if listener.is_cancelled:
         return False
-    listener.suproc = await create_subprocess_exec(*cmd, stderr=PIPE)
-    _, stderr = await listener.suproc.communicate()
-    if listener.cancelled:
+    async with subprocess_lock:
+        listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+    _, stderr = await listener.subproc.communicate()
+    if listener.is_cancelled:
         return False
-    code = listener.suproc.returncode
+    code = listener.subproc.returncode
     if code == 0:
         return output
     elif code == -9:
-        listener.cancelled = True
+        listener.is_cancelled = True
         return False
     else:
-        stderr = stderr.decode().strip()
-        LOGGER.error(
-            f"{f'{stderr}. ' if retry else ''}Something went wrong while converting video, mostly file need specific codec. {'' if retry else 'Retrying with specific codec'}. Path: {video_file}"
-        )
         if not retry:
             if await aiopath.exists(output):
                 await remove(output)
             return await convert_video(listener, video_file, ext, True)
+        else:
+            try:
+                stderr = stderr.decode().strip()
+            except:
+                stderr = "Unable to decode the error!"
+            LOGGER.error(
+                f"{stderr}. Something went wrong while converting video, mostly file need specific codec. Path: {video_file}"
+            )
     return False
 
 
@@ -65,26 +85,33 @@ async def convert_audio(listener, audio_file, ext):
     output = f"{base_name}.{ext}"
     cmd = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-i",
         audio_file,
         "-threads",
         f"{cpu_count() // 2}",
         output,
     ]
-    if listener.cancelled:
+    if listener.is_cancelled:
         return False
-    listener.suproc = await create_subprocess_exec(*cmd, stderr=PIPE)
-    _, stderr = await listener.suproc.communicate()
-    if listener.cancelled:
+    async with subprocess_lock:
+        listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+    _, stderr = await listener.subproc.communicate()
+    if listener.is_cancelled:
         return False
-    code = listener.suproc.returncode
+    code = listener.subproc.returncode
     if code == 0:
         return output
     elif code == -9:
-        listener.cancelled = True
+        listener.is_cancelled = True
         return False
     else:
-        stderr = stderr.decode().strip()
+        try:
+            stderr = stderr.decode().strip()
+        except:
+            stderr = "Unable to decode the error!"
         LOGGER.error(
             f"{stderr}. Something went wrong while converting audio, mostly file need specific codec. Path: {audio_file}"
         )
@@ -93,16 +120,18 @@ async def convert_audio(listener, audio_file, ext):
     return False
 
 
-async def createThumb(msg, _id=""):
+async def create_thumb(msg, _id=""):
     if not _id:
         _id = msg.id
-    path = "Thumbnails/"
+        path = f"{DOWNLOAD_DIR}Thumbnails"
+    else:
+        path = "Thumbnails"
     await makedirs(path, exist_ok=True)
     photo_dir = await msg.download()
-    des_dir = f"{path}{_id}.jpg"
-    await sync_to_async(Image.open(photo_dir).convert("RGB").save, des_dir, "JPEG")
+    output = ospath.join(path, f"{_id}.jpg")
+    await sync_to_async(Image.open(photo_dir).convert("RGB").save, output, "JPEG")
     await remove(photo_dir)
-    return des_dir
+    return output
 
 
 async def is_multi_streams(path):
@@ -119,8 +148,6 @@ async def is_multi_streams(path):
                 path,
             ]
         )
-        if res := result[1]:
-            LOGGER.warning(f"Get Video Streams: {res} - File: {path}")
     except Exception as e:
         LOGGER.error(f"Get Video Streams: {e}. Mostly File not found! - File: {path}")
         return False
@@ -154,8 +181,6 @@ async def get_media_info(path):
                 path,
             ]
         )
-        if res := result[1]:
-            LOGGER.warning(f"Get Media Info: {res} - File: {path}")
     except Exception as e:
         LOGGER.error(f"Get Media Info: {e}. Mostly File not found! - File: {path}")
         return 0, None, None
@@ -181,10 +206,6 @@ async def get_document_type(path):
     mime_type = await sync_to_async(get_mime_type, path)
     if mime_type.startswith("image"):
         return False, False, True
-    if mime_type.startswith("audio"):
-        return False, True, False
-    if not mime_type.startswith("video") and not mime_type.endswith("octet-stream"):
-        return is_video, is_audio, is_image
     try:
         result = await cmd_exec(
             [
@@ -198,12 +219,14 @@ async def get_document_type(path):
                 path,
             ]
         )
-        if res := result[1]:
-            LOGGER.warning(f"Get Document Type: {res} - File: {path}")
-            if mime_type.startswith("video"):
-                is_video = True
+        if result[1] and mime_type.startswith("video"):
+            is_video = True
     except Exception as e:
         LOGGER.error(f"Get Document Type: {e}. Mostly File not found! - File: {path}")
+        if mime_type.startswith("audio"):
+            return False, True, False
+        if not mime_type.startswith("video") and not mime_type.endswith("octet-stream"):
+            return is_video, is_audio, is_image
         if mime_type.startswith("video"):
             is_video = True
         return is_video, is_audio, is_image
@@ -221,21 +244,18 @@ async def get_document_type(path):
     return is_video, is_audio, is_image
 
 
-async def take_ss(video_file, ss_nb) -> list:
-    ss_nb = min(ss_nb, 10)
+async def take_ss(video_file, ss_nb) -> bool:
     duration = (await get_media_info(video_file))[0]
     if duration != 0:
         dirpath, name = video_file.rsplit("/", 1)
         name, _ = ospath.splitext(name)
-        dirpath = f"{dirpath}/screenshots/"
+        dirpath = f"{dirpath}/{name}_mltbss"
         await makedirs(dirpath, exist_ok=True)
         interval = duration // (ss_nb + 1)
         cap_time = interval
-        outputs = []
         cmds = []
         for i in range(ss_nb):
-            output = f"{dirpath}SS.{name}_{i:02}.png"
-            outputs.append(output)
+            output = f"{dirpath}/SS.{name}_{i:02}.png"
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -249,32 +269,36 @@ async def take_ss(video_file, ss_nb) -> list:
                 "1",
                 "-frames:v",
                 "1",
+                "-threads",
+                f"{cpu_count() // 2}",
                 output,
             ]
             cap_time += interval
             cmds.append(cmd_exec(cmd))
         try:
-            resutls = await wait_for(gather(*cmds), timeout=15)
+            resutls = await wait_for(gather(*cmds), timeout=60)
             if resutls[0][2] != 0:
                 LOGGER.error(
                     f"Error while creating sreenshots from video. Path: {video_file}. stderr: {resutls[0][1]}"
                 )
-                return []
+                await rmtree(dirpath, ignore_errors=True)
+                return False
         except:
             LOGGER.error(
                 f"Error while creating sreenshots from video. Path: {video_file}. Error: Timeout some issues with ffmpeg with specific arch!"
             )
-            return []
-        return outputs
+            await rmtree(dirpath, ignore_errors=True)
+            return False
+        return dirpath
     else:
         LOGGER.error("take_ss: Can't get the duration of video")
-        return []
+        return False
 
 
-async def get_audio_thumb(audio_file):
-    des_dir = "Thumbnails/"
-    await makedirs(des_dir, exist_ok=True)
-    des_dir = f"Thumbnails/{time()}.jpg"
+async def get_audio_thumbnail(audio_file):
+    output_dir = f"{DOWNLOAD_DIR}Thumbnails"
+    await makedirs(output_dir, exist_ok=True)
+    output = ospath.join(output_dir, f"{time()}.jpg")
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -285,21 +309,23 @@ async def get_audio_thumb(audio_file):
         "-an",
         "-vcodec",
         "copy",
-        des_dir,
+        "-threads",
+        f"{cpu_count() // 2}",
+        output,
     ]
     _, err, code = await cmd_exec(cmd)
-    if code != 0 or not await aiopath.exists(des_dir):
+    if code != 0 or not await aiopath.exists(output):
         LOGGER.error(
             f"Error while extracting thumbnail from audio. Name: {audio_file} stderr: {err}"
         )
         return None
-    return des_dir
+    return output
 
 
-async def create_thumbnail(video_file, duration):
-    des_dir = "Thumbnails"
-    await makedirs(des_dir, exist_ok=True)
-    des_dir = ospath.join(des_dir, f"{time()}.jpg")
+async def get_video_thumbnail(video_file, duration):
+    output_dir = f"{DOWNLOAD_DIR}Thumbnails"
+    await makedirs(output_dir, exist_ok=True)
+    output = ospath.join(output_dir, f"{time()}.jpg")
     if duration is None:
         duration = (await get_media_info(video_file))[0]
     if duration == 0:
@@ -316,13 +342,17 @@ async def create_thumbnail(video_file, duration):
         video_file,
         "-vf",
         "thumbnail",
+        "-q:v",
+        "1",
         "-frames:v",
         "1",
-        des_dir,
+        "-threads",
+        f"{cpu_count() // 2}",
+        output,
     ]
     try:
-        _, err, code = await wait_for(cmd_exec(cmd), timeout=15)
-        if code != 0 or not await aiopath.exists(des_dir):
+        _, err, code = await wait_for(cmd_exec(cmd), timeout=60)
+        if code != 0 or not await aiopath.exists(output):
             LOGGER.error(
                 f"Error while extracting thumbnail from video. Name: {video_file} stderr: {err}"
             )
@@ -332,7 +362,55 @@ async def create_thumbnail(video_file, duration):
             f"Error while extracting thumbnail from video. Name: {video_file}. Error: Timeout some issues with ffmpeg with specific arch!"
         )
         return None
-    return des_dir
+    return output
+
+
+async def get_multiple_frames_thumbnail(video_file, layout, keep_screenshots):
+    ss_nb = layout.split("x")
+    ss_nb = int(ss_nb[0]) * int(ss_nb[1])
+    dirpath = await take_ss(video_file, ss_nb)
+    if not dirpath:
+        return None
+    output_dir = f"{DOWNLOAD_DIR}Thumbnails"
+    await makedirs(output_dir, exist_ok=True)
+    output = ospath.join(output_dir, f"{time()}.jpg")
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-pattern_type",
+        "glob",
+        "-i",
+        f"{escape(dirpath)}/*.png",
+        "-vf",
+        f"tile={layout}, thumbnail",
+        "-q:v",
+        "1",
+        "-frames:v",
+        "1",
+        "-f",
+        "mjpeg",
+        "-threads",
+        f"{cpu_count() // 2}",
+        output,
+    ]
+    try:
+        _, err, code = await wait_for(cmd_exec(cmd), timeout=60)
+        if code != 0 or not await aiopath.exists(output):
+            LOGGER.error(
+                f"Error while combining thumbnails for video. Name: {video_file} stderr: {err}"
+            )
+            return None
+    except:
+        LOGGER.error(
+            f"Error while combining thumbnails from video. Name: {video_file}. Error: Timeout some issues with ffmpeg with specific arch!"
+        )
+        return None
+    finally:
+        if not keep_screenshots:
+            await rmtree(dirpath, ignore_errors=True)
+    return output
 
 
 async def split_file(
@@ -347,13 +425,13 @@ async def split_file(
     inLoop=False,
     multi_streams=True,
 ):
-    if listener.seed and not listener.newDir:
+    if listener.seed and not listener.new_dir:
         dirpath = f"{dirpath}/splited_files_mltb"
         await makedirs(dirpath, exist_ok=True)
-    parts = -(-size // listener.splitSize)
-    if listener.equalSplits and not inLoop:
+    parts = -(-size // listener.split_size)
+    if listener.equal_splits and not inLoop:
         split_size = (size // parts) + (size % parts)
-    if not listener.asDoc and (await get_document_type(path))[0]:
+    if not listener.as_doc and (await get_document_type(path))[0]:
         if multi_streams:
             multi_streams = await is_multi_streams(path)
         duration = (await get_media_info(path))[0]
@@ -387,19 +465,22 @@ async def split_file(
             if not multi_streams:
                 del cmd[10]
                 del cmd[10]
-            if listener.cancelled:
+            if listener.is_cancelled:
                 return False
             async with subprocess_lock:
-                listener.suproc = await create_subprocess_exec(*cmd, stderr=PIPE)
-            _, stderr = await listener.suproc.communicate()
-            if listener.cancelled:
+                listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+            _, stderr = await listener.subproc.communicate()
+            if listener.is_cancelled:
                 return False
-            code = listener.suproc.returncode
+            code = listener.subproc.returncode
             if code == -9:
-                listener.cancelled = True
+                listener.is_cancelled = True
                 return False
             elif code != 0:
-                stderr = stderr.decode().strip()
+                try:
+                    stderr = stderr.decode().strip()
+                except:
+                    stderr = "Unable to decode the error!"
                 try:
                     await remove(out_path)
                 except:
@@ -422,12 +503,12 @@ async def split_file(
                     )
                 else:
                     LOGGER.warning(
-                        f"{stderr}. Unable to split this video, if it's size less than {listener.maxSplitSize} will be uploaded as it is. Path: {path}"
+                        f"{stderr}. Unable to split this video, if it's size less than {listener.max_split_size} will be uploaded as it is. Path: {path}"
                     )
                 return False
             out_size = await aiopath.getsize(out_path)
-            if out_size > listener.maxSplitSize:
-                dif = out_size - listener.maxSplitSize
+            if out_size > listener.max_split_size:
+                dif = out_size - listener.max_split_size
                 split_size -= dif + 5000000
                 await remove(out_path)
                 return await split_file(
@@ -461,9 +542,9 @@ async def split_file(
     else:
         out_path = f"{dirpath}/{file_}."
         async with subprocess_lock:
-            if listener.cancelled:
+            if listener.is_cancelled:
                 return False
-            listener.suproc = await create_subprocess_exec(
+            listener.subproc = await create_subprocess_exec(
                 "split",
                 "--numeric-suffixes=1",
                 "--suffix-length=3",
@@ -472,21 +553,23 @@ async def split_file(
                 out_path,
                 stderr=PIPE,
             )
-        _, stderr = await listener.suproc.communicate()
-        if listener.cancelled:
+        _, stderr = await listener.subproc.communicate()
+        if listener.is_cancelled:
             return False
-        code = listener.suproc.returncode
+        code = listener.subproc.returncode
         if code == -9:
-            listener.cancelled = True
+            listener.is_cancelled = True
             return False
         elif code != 0:
-            stderr = stderr.decode().strip()
+            try:
+                stderr = stderr.decode().strip()
+            except:
+                stderr = "Unable to decode the error!"
             LOGGER.error(f"{stderr}. Split Document: {path}")
     return True
 
 
-async def createSampleVideo(listener, video_file, sample_duration, part_duration):
-    filter_complex = ""
+async def create_sample_video(listener, video_file, sample_duration, part_duration):
     dir, name = video_file.rsplit("/", 1)
     output_file = f"{dir}/SAMPLE.{name}"
     segments = [(0, part_duration)]
@@ -500,6 +583,7 @@ async def createSampleVideo(listener, video_file, sample_duration, part_duration
         next_segment += time_interval
     segments.append((duration - part_duration, duration))
 
+    filter_complex = ""
     for i, (start, end) in enumerate(segments):
         filter_complex += (
             f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}]; "
@@ -515,6 +599,9 @@ async def createSampleVideo(listener, video_file, sample_duration, part_duration
 
     cmd = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-i",
         video_file,
         "-filter_complex",
@@ -532,23 +619,160 @@ async def createSampleVideo(listener, video_file, sample_duration, part_duration
         output_file,
     ]
 
-    if listener.cancelled:
+    if listener.is_cancelled:
         return False
-    listener.suproc = await create_subprocess_exec(*cmd, stderr=PIPE)
-    _, stderr = await listener.suproc.communicate()
-    if listener.cancelled:
+    async with subprocess_lock:
+        listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+    _, stderr = await listener.subproc.communicate()
+    if listener.is_cancelled:
         return False
-    code = listener.suproc.returncode
+    code = listener.subproc.returncode
     if code == -9:
-        listener.cancelled = True
+        listener.is_cancelled = True
         return False
     elif code == 0:
         return output_file
     else:
-        stderr = stderr.decode().strip()
+        try:
+            stderr = stderr.decode().strip()
+        except Exception:
+            stderr = "Unable to decode the error!"
         LOGGER.error(
             f"{stderr}. Something went wrong while creating sample video, mostly file is corrupted. Path: {video_file}"
         )
         if await aiopath.exists(output_file):
             await remove(output_file)
+        return False
+
+    """finished_segments = []
+    await makedirs(f"{dir}/mltb_segments/", exist_ok=True)
+    ext = name.rsplit(".", 1)[-1]
+    for index, (start_time, end_time) in enumerate(segments, start=1):
+        output_seg = f"{dir}/mltb_segments/segment{index}.{ext}"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_file,
+            "-ss",
+            f"{start_time}",
+            "-to",
+            f"{end_time}",
+            "-c",
+            "copy",
+            output_seg,
+        ]
+        if listener.is_cancelled:
+            return False
+        listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+        _, stderr = await listener.subproc.communicate()
+        if listener.is_cancelled:
+            return False
+        code = listener.subproc.returncode
+        if code == -9:
+            listener.is_cancelled = True
+            return False
+        elif code != 0:
+            try:
+                stderr = stderr.decode().strip()
+            except:
+                stderr = "Unable to decode the error!"
+            LOGGER.error(
+                f"{stderr}. Something went wrong while splitting file for sample video, mostly file is corrupted. Path: {video_file}"
+            )
+            if await aiopath.exists(output_file):
+                await remove(output_file)
+            return False
+        else:
+            finished_segments.append(f"file '{output_seg}'")
+
+    segments_file = f"{dir}/segments.txt"
+
+    async with aiopen(segments_file, "w+") as f:
+        await f.write("\n".join(finished_segments))
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        segments_file,
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-threads",
+        f"{cpu_count() // 2}",
+        output_file,
+    ]
+    if listener.is_cancelled:
+        return False
+    listener.subproc = await create_subprocess_exec(*cmd, stderr=PIPE)
+    _, stderr = await listener.subproc.communicate()
+    if listener.is_cancelled:
+        return False
+    code = listener.subproc.returncode
+    if code == -9:
+        listener.is_cancelled = True
+        return False
+    elif code != 0:
+        try:
+            stderr = stderr.decode().strip()
+        except:
+            stderr = "Unable to decode the error!"
+        LOGGER.error(
+            f"{stderr}. Something went wrong while creating sample video, mostly file is corrupted. Path: {video_file}"
+        )
+        if await aiopath.exists(output_file):
+            await remove(output_file)
+        await gather(remove(segments_file), rmtree(f"{dir}/mltb_segments"))
+        return False
+    await gather(remove(segments_file), rmtree(f"{dir}/mltb_segments"))
+    return output_file"""
+
+
+async def run_ffmpeg_cmd(listener, ffmpeg, path):
+    base_name, ext = ospath.splitext(path)
+    dir, base_name = base_name.rsplit("/", 1)
+    output_file = ffmpeg[-1]
+    if output_file != "mltb" and output_file.startswith("mltb"):
+        oext = ospath.splitext(output_file)[-1]
+        if ext == oext:
+            base_name = f"ffmpeg.{base_name}"
+        else:
+            ext = oext
+    else:
+        base_name = f"ffmpeg.{base_name}"
+    output = f"{dir}/{base_name}{ext}"
+    ffmpeg[-1] = output
+    if listener.is_cancelled:
+        return False
+    async with subprocess_lock:
+        listener.subproc = await create_subprocess_exec(*ffmpeg, stderr=PIPE)
+    _, stderr = await listener.subproc.communicate()
+    if listener.is_cancelled:
+        return False
+    code = listener.subproc.returncode
+    if code == 0:
+        return output
+    elif code == -9:
+        listener.is_cancelled = True
+        return False
+    else:
+        try:
+            stderr = stderr.decode().strip()
+        except:
+            stderr = "Unable to decode the error!"
+        LOGGER.error(
+            f"{stderr}. Something went wrong while running ffmpeg cmd, mostly file requires different/specific arguments. Path: {path}"
+        )
+        if await aiopath.exists(output):
+            await remove(output)
         return False

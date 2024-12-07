@@ -1,6 +1,7 @@
+from sys import exit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aria2p import API as ariaAPI, Client as ariaClient
-from asyncio import Lock
+from asyncio import Lock, new_event_loop, set_event_loop
 from dotenv import load_dotenv, dotenv_values
 from logging import (
     getLogger,
@@ -13,10 +14,13 @@ from logging import (
     warning as log_warning,
     ERROR,
 )
-from os import remove, path as ospath, environ, getcwd
-from pymongo import MongoClient
-from pyrogram import Client as tgClient, enums
-from qbittorrentapi import Client as qbClient
+from shutil import rmtree
+from os import remove, path as ospath, environ
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+from pyrogram import Client as TgClient, enums
+from qbittorrentapi import Client as QbClient
+from sabnzbdapi import SabnzbdClient
 from socket import setdefaulttimeout
 from subprocess import Popen, run
 from time import time
@@ -34,8 +38,12 @@ getLogger("requests").setLevel(INFO)
 getLogger("urllib3").setLevel(INFO)
 getLogger("pyrogram").setLevel(ERROR)
 getLogger("httpx").setLevel(ERROR)
+getLogger("pymongo").setLevel(ERROR)
 
 botStartTime = time()
+
+bot_loop = new_event_loop()
+set_event_loop(bot_loop)
 
 basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,16 +55,18 @@ LOGGER = getLogger(__name__)
 
 load_dotenv("config.env", override=True)
 
-Intervals = {"status": {}, "qb": "", "jd": "", "stopAll": False}
-QbTorrents = {}
+intervals = {"status": {}, "qb": "", "jd": "", "nzb": "", "stopAll": False}
+qb_torrents = {}
 jd_downloads = {}
-DRIVES_NAMES = []
-DRIVES_IDS = []
-INDEX_URLS = []
-GLOBAL_EXTENSION_FILTER = ["aria2", "!qB"]
+nzb_jobs = {}
+drives_names = []
+drives_ids = []
+index_urls = []
+global_extension_filter = ["aria2", "!qB"]
 user_data = {}
 aria2_options = {}
 qbit_options = {}
+nzb_options = {}
 queued_dl = {}
 queued_up = {}
 non_queued_dl = set()
@@ -66,6 +76,7 @@ multi_tags = set()
 try:
     if bool(environ.get("_____REMOVE_THIS_LINE_____")):
         log_error("The README.md file there to be read! Exiting now!")
+        bot_loop.stop()
         exit(1)
 except:
     pass
@@ -73,9 +84,11 @@ except:
 task_dict_lock = Lock()
 queue_dict_lock = Lock()
 qb_listener_lock = Lock()
+nzb_listener_lock = Lock()
 jd_lock = Lock()
 cpu_eater_lock = Lock()
 subprocess_lock = Lock()
+same_directory_lock = Lock()
 status_dict = {}
 task_dict = {}
 rss_dict = {}
@@ -83,9 +96,10 @@ rss_dict = {}
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
 if len(BOT_TOKEN) == 0:
     log_error("BOT_TOKEN variable is missing! Exiting now")
+    bot_loop.stop()
     exit(1)
 
-bot_id = BOT_TOKEN.split(":", 1)[0]
+BOT_ID = BOT_TOKEN.split(":", 1)[0]
 
 DATABASE_URL = environ.get("DATABASE_URL", "")
 if len(DATABASE_URL) == 0:
@@ -93,61 +107,72 @@ if len(DATABASE_URL) == 0:
 
 if DATABASE_URL:
     try:
-        conn = MongoClient(DATABASE_URL)
+        conn = MongoClient(DATABASE_URL, server_api=ServerApi("1"))
         db = conn.mltb
         current_config = dict(dotenv_values("config.env"))
-        old_config = db.settings.deployConfig.find_one({"_id": bot_id})
+        old_config = db.settings.deployConfig.find_one({"_id": BOT_ID})
         if old_config is None:
             db.settings.deployConfig.replace_one(
-                {"_id": bot_id}, current_config, upsert=True
+                {"_id": BOT_ID}, current_config, upsert=True
             )
         else:
             del old_config["_id"]
         if old_config and old_config != current_config:
             db.settings.deployConfig.replace_one(
-                {"_id": bot_id}, current_config, upsert=True
+                {"_id": BOT_ID}, current_config, upsert=True
             )
-        elif config_dict := db.settings.config.find_one({"_id": bot_id}):
+        elif config_dict := db.settings.config.find_one({"_id": BOT_ID}):
             del config_dict["_id"]
             for key, value in config_dict.items():
                 environ[key] = str(value)
-        if pf_dict := db.settings.files.find_one({"_id": bot_id}):
+        if pf_dict := db.settings.files.find_one({"_id": BOT_ID}):
             del pf_dict["_id"]
             for key, value in pf_dict.items():
                 if value:
                     file_ = key.replace("__", ".")
                     with open(file_, "wb+") as f:
                         f.write(value)
-                    if file_ == "cfg.zip":
-                        run(["rm", "-rf", "/JDownloader/cfg"])
-                        run(["7z", "x", "cfg.zip", "-o/JDownloader"])
-                        remove("cfg.zip")
-        if a2c_options := db.settings.aria2c.find_one({"_id": bot_id}):
+        if a2c_options := db.settings.aria2c.find_one({"_id": BOT_ID}):
             del a2c_options["_id"]
             aria2_options = a2c_options
-        if qbit_opt := db.settings.qbittorrent.find_one({"_id": bot_id}):
+        if qbit_opt := db.settings.qbittorrent.find_one({"_id": BOT_ID}):
             del qbit_opt["_id"]
             qbit_options = qbit_opt
+        if nzb_opt := db.settings.nzb.find_one({"_id": BOT_ID}):
+            if ospath.exists("sabnzbd/SABnzbd.ini.bak"):
+                remove("sabnzbd/SABnzbd.ini.bak")
+            del nzb_opt["_id"]
+            ((key, value),) = nzb_opt.items()
+            file_ = key.replace("__", ".")
+            with open(f"sabnzbd/{file_}", "wb+") as f:
+                f.write(value)
         conn.close()
         BOT_TOKEN = environ.get("BOT_TOKEN", "")
-        bot_id = BOT_TOKEN.split(":", 1)[0]
+        BOT_ID = BOT_TOKEN.split(":", 1)[0]
         DATABASE_URL = environ.get("DATABASE_URL", "")
     except Exception as e:
         LOGGER.error(f"Database ERROR: {e}")
 else:
     config_dict = {}
 
+if ospath.exists("cfg.zip"):
+    if ospath.exists("/JDownloader/cfg"):
+        rmtree("/JDownloader/cfg", ignore_errors=True)
+    run(["7z", "x", "cfg.zip", "-o/JDownloader"])
+    remove("cfg.zip")
+
 if not ospath.exists(".netrc"):
     with open(".netrc", "w"):
         pass
 run(
-    "chmod 600 .netrc && cp .netrc /root/.netrc && chmod +x aria-nox.sh && ./aria-nox.sh",
+    "chmod 600 .netrc && cp .netrc /root/.netrc && chmod +x aria-nox-nzb.sh && ./aria-nox-nzb.sh",
     shell=True,
 )
 
 OWNER_ID = environ.get("OWNER_ID", "")
 if len(OWNER_ID) == 0:
     log_error("OWNER_ID variable is missing! Exiting now")
+    bot_loop.stop()
     exit(1)
 else:
     OWNER_ID = int(OWNER_ID)
@@ -155,6 +180,7 @@ else:
 TELEGRAM_API = environ.get("TELEGRAM_API", "")
 if len(TELEGRAM_API) == 0:
     log_error("TELEGRAM_API variable is missing! Exiting now")
+    bot_loop.stop()
     exit(1)
 else:
     TELEGRAM_API = int(TELEGRAM_API)
@@ -162,7 +188,29 @@ else:
 TELEGRAM_HASH = environ.get("TELEGRAM_HASH", "")
 if len(TELEGRAM_HASH) == 0:
     log_error("TELEGRAM_HASH variable is missing! Exiting now")
+    bot_loop.stop()
     exit(1)
+
+USER_SESSION_STRING = environ.get("USER_SESSION_STRING", "")
+if len(USER_SESSION_STRING) != 0:
+    log_info("Creating client from USER_SESSION_STRING")
+    try:
+        user = TgClient(
+            "user",
+            TELEGRAM_API,
+            TELEGRAM_HASH,
+            session_string=USER_SESSION_STRING,
+            parse_mode=enums.ParseMode.HTML,
+            max_concurrent_transmissions=10,
+        ).start()
+        IS_PREMIUM_USER = user.me.is_premium
+    except:
+        log_error("Failed to start client from USER_SESSION_STRING")
+        IS_PREMIUM_USER = False
+        user = ""
+else:
+    IS_PREMIUM_USER = False
+    user = ""
 
 GDRIVE_ID = environ.get("GDRIVE_ID", "")
 if len(GDRIVE_ID) == 0:
@@ -177,8 +225,8 @@ if len(RCLONE_FLAGS) == 0:
     RCLONE_FLAGS = ""
 
 DEFAULT_UPLOAD = environ.get("DEFAULT_UPLOAD", "")
-if DEFAULT_UPLOAD != "rc":
-    DEFAULT_UPLOAD = "gd"
+if DEFAULT_UPLOAD != "gd":
+    DEFAULT_UPLOAD = "rc"
 
 DOWNLOAD_DIR = environ.get("DOWNLOAD_DIR", "")
 if len(DOWNLOAD_DIR) == 0:
@@ -190,7 +238,13 @@ AUTHORIZED_CHATS = environ.get("AUTHORIZED_CHATS", "")
 if len(AUTHORIZED_CHATS) != 0:
     aid = AUTHORIZED_CHATS.split()
     for id_ in aid:
-        user_data[int(id_.strip())] = {"is_auth": True}
+        chat_id, *thread_ids = id_.split("|")
+        chat_id = int(chat_id.strip())
+        if thread_ids:
+            thread_ids = list(map(lambda x: int(x.strip()), thread_ids))
+            user_data[chat_id] = {"is_auth": True, "thread_ids": thread_ids}
+        else:
+            user_data[chat_id] = {"is_auth": True}
 
 SUDO_USERS = environ.get("SUDO_USERS", "")
 if len(SUDO_USERS) != 0:
@@ -203,29 +257,25 @@ if len(EXTENSION_FILTER) > 0:
     fx = EXTENSION_FILTER.split()
     for x in fx:
         x = x.lstrip(".")
-        GLOBAL_EXTENSION_FILTER.append(x.strip().lower())
-
-USER_SESSION_STRING = environ.get("USER_SESSION_STRING", "")
-if len(USER_SESSION_STRING) != 0:
-    log_info("Creating client from USER_SESSION_STRING")
-    user = tgClient(
-        "user",
-        TELEGRAM_API,
-        TELEGRAM_HASH,
-        session_string=USER_SESSION_STRING,
-        parse_mode=enums.ParseMode.HTML,
-        max_concurrent_transmissions=10,
-    ).start()
-    IS_PREMIUM_USER = user.me.is_premium
-else:
-    IS_PREMIUM_USER = False
-    user = ""
+        global_extension_filter.append(x.strip().lower())
 
 JD_EMAIL = environ.get("JD_EMAIL", "")
 JD_PASS = environ.get("JD_PASS", "")
 if len(JD_EMAIL) == 0 or len(JD_PASS) == 0:
     JD_EMAIL = ""
     JD_PASS = ""
+
+USENET_SERVERS = environ.get("USENET_SERVERS", "")
+try:
+    if len(USENET_SERVERS) == 0:
+        USENET_SERVERS = []
+    elif (us := eval(USENET_SERVERS)) and not us[0].get("host"):
+        USENET_SERVERS = []
+    else:
+        USENET_SERVERS = eval(USENET_SERVERS)
+except:
+    log_error(f"Wrong USENET_SERVERS format: {USENET_SERVERS}")
+    USENET_SERVERS = []
 
 FILELION_API = environ.get("FILELION_API", "")
 if len(FILELION_API) == 0:
@@ -250,6 +300,12 @@ if len(LEECH_FILENAME_PREFIX) == 0:
 SEARCH_PLUGINS = environ.get("SEARCH_PLUGINS", "")
 if len(SEARCH_PLUGINS) == 0:
     SEARCH_PLUGINS = ""
+else:
+    try:
+        SEARCH_PLUGINS = eval(SEARCH_PLUGINS)
+    except:
+        log_error(f"Wrong USENET_SERVERS format: {SEARCH_PLUGINS}")
+        SEARCH_PLUGINS = ""
 
 MAX_SPLIT_SIZE = 4194304000 if IS_PREMIUM_USER else 2097152000
 
@@ -278,18 +334,14 @@ SEARCH_LIMIT = 0 if len(SEARCH_LIMIT) == 0 else int(SEARCH_LIMIT)
 
 LEECH_DUMP_CHAT = environ.get("LEECH_DUMP_CHAT", "")
 LEECH_DUMP_CHAT = "" if len(LEECH_DUMP_CHAT) == 0 else LEECH_DUMP_CHAT
-if LEECH_DUMP_CHAT.isdigit() or LEECH_DUMP_CHAT.startswith("-"):
-    LEECH_DUMP_CHAT = int(LEECH_DUMP_CHAT)
 
 STATUS_LIMIT = environ.get("STATUS_LIMIT", "")
-STATUS_LIMIT = 10 if len(STATUS_LIMIT) == 0 else int(STATUS_LIMIT)
+STATUS_LIMIT = 4 if len(STATUS_LIMIT) == 0 else int(STATUS_LIMIT)
 
 CMD_SUFFIX = environ.get("CMD_SUFFIX", "")
 
 RSS_CHAT = environ.get("RSS_CHAT", "")
 RSS_CHAT = "" if len(RSS_CHAT) == 0 else RSS_CHAT
-if RSS_CHAT.isdigit() or RSS_CHAT.startswith("-"):
-    RSS_CHAT = int(RSS_CHAT)
 
 RSS_DELAY = environ.get("RSS_DELAY", "")
 RSS_DELAY = 600 if len(RSS_DELAY) == 0 else int(RSS_DELAY)
@@ -364,6 +416,22 @@ RCLONE_SERVE_PASS = environ.get("RCLONE_SERVE_PASS", "")
 if len(RCLONE_SERVE_PASS) == 0:
     RCLONE_SERVE_PASS = ""
 
+NAME_SUBSTITUTE = environ.get("NAME_SUBSTITUTE", "")
+NAME_SUBSTITUTE = "" if len(NAME_SUBSTITUTE) == 0 else NAME_SUBSTITUTE
+
+MIXED_LEECH = environ.get("MIXED_LEECH", "")
+MIXED_LEECH = MIXED_LEECH.lower() == "true" and IS_PREMIUM_USER
+
+THUMBNAIL_LAYOUT = environ.get("THUMBNAIL_LAYOUT", "")
+THUMBNAIL_LAYOUT = "" if len(THUMBNAIL_LAYOUT) == 0 else THUMBNAIL_LAYOUT
+
+FFMPEG_CMDS = environ.get("FFMPEG_CMDS", "")
+try:
+    FFMPEG_CMDS = [] if len(FFMPEG_CMDS) == 0 else eval(FFMPEG_CMDS)
+except:
+    log_error(f"Wrong FFMPEG_CMDS format: {FFMPEG_CMDS}")
+    FFMPEG_CMDS = []
+
 config_dict = {
     "AS_DOCUMENT": AS_DOCUMENT,
     "AUTHORIZED_CHATS": AUTHORIZED_CHATS,
@@ -376,6 +444,7 @@ config_dict = {
     "DOWNLOAD_DIR": DOWNLOAD_DIR,
     "EQUAL_SPLITS": EQUAL_SPLITS,
     "EXTENSION_FILTER": EXTENSION_FILTER,
+    "FFMPEG_CMDS": FFMPEG_CMDS,
     "FILELION_API": FILELION_API,
     "GDRIVE_ID": GDRIVE_ID,
     "INCOMPLETE_TASK_NOTIFIER": INCOMPLETE_TASK_NOTIFIER,
@@ -387,6 +456,8 @@ config_dict = {
     "LEECH_FILENAME_PREFIX": LEECH_FILENAME_PREFIX,
     "LEECH_SPLIT_SIZE": LEECH_SPLIT_SIZE,
     "MEDIA_GROUP": MEDIA_GROUP,
+    "MIXED_LEECH": MIXED_LEECH,
+    "NAME_SUBSTITUTE": NAME_SUBSTITUTE,
     "OWNER_ID": OWNER_ID,
     "QUEUE_ALL": QUEUE_ALL,
     "QUEUE_DOWNLOAD": QUEUE_DOWNLOAD,
@@ -409,10 +480,12 @@ config_dict = {
     "SUDO_USERS": SUDO_USERS,
     "TELEGRAM_API": TELEGRAM_API,
     "TELEGRAM_HASH": TELEGRAM_HASH,
+    "THUMBNAIL_LAYOUT": THUMBNAIL_LAYOUT,
     "TORRENT_TIMEOUT": TORRENT_TIMEOUT,
     "USER_TRANSMISSION": USER_TRANSMISSION,
     "UPSTREAM_REPO": UPSTREAM_REPO,
     "UPSTREAM_BRANCH": UPSTREAM_BRANCH,
+    "USENET_SERVERS": USENET_SERVERS,
     "USER_SESSION_STRING": USER_SESSION_STRING,
     "USE_SERVICE_ACCOUNTS": USE_SERVICE_ACCOUNTS,
     "WEB_PINCODE": WEB_PINCODE,
@@ -420,21 +493,21 @@ config_dict = {
 }
 
 if GDRIVE_ID:
-    DRIVES_NAMES.append("Main")
-    DRIVES_IDS.append(GDRIVE_ID)
-    INDEX_URLS.append(INDEX_URL)
+    drives_names.append("Main")
+    drives_ids.append(GDRIVE_ID)
+    index_urls.append(INDEX_URL)
 
 if ospath.exists("list_drives.txt"):
     with open("list_drives.txt", "r+") as f:
         lines = f.readlines()
         for line in lines:
             temp = line.strip().split()
-            DRIVES_IDS.append(temp[1])
-            DRIVES_NAMES.append(temp[0].replace("_", " "))
+            drives_ids.append(temp[1])
+            drives_names.append(temp[0].replace("_", " "))
             if len(temp) > 2:
-                INDEX_URLS.append(temp[2])
+                index_urls.append(temp[2])
             else:
-                INDEX_URLS.append("")
+                index_urls.append("")
 
 if BASE_URL:
     Popen(
@@ -444,21 +517,30 @@ if BASE_URL:
 
 if ospath.exists("accounts.zip"):
     if ospath.exists("accounts"):
-        run(["rm", "-rf", "accounts"])
+        rmtree("accounts")
     run(["7z", "x", "-o.", "-aoa", "accounts.zip", "accounts/*.json"])
     run(["chmod", "-R", "777", "accounts"])
     remove("accounts.zip")
 if not ospath.exists("accounts"):
     config_dict["USE_SERVICE_ACCOUNTS"] = False
 
+qbittorrent_client = QbClient(
+    host="localhost",
+    port=8090,
+    VERIFY_WEBUI_CERTIFICATE=False,
+    REQUESTS_ARGS={"timeout": (30, 60)},
+    HTTPADAPTER_ARGS={
+        "pool_maxsize": 500,
+        "max_retries": 10,
+        "pool_block": True,
+    },
+)
 
-def get_qb_client():
-    return qbClient(
-        host="localhost",
-        port=8090,
-        VERIFY_WEBUI_CERTIFICATE=False,
-        REQUESTS_ARGS={"timeout": (30, 60)},
-    )
+sabnzbd_client = SabnzbdClient(
+    host="http://localhost",
+    api_key="mltb",
+    port="8070",
+)
 
 
 aria2c_global = [
@@ -478,32 +560,35 @@ aria2c_global = [
 ]
 
 log_info("Creating client from BOT_TOKEN")
-bot = tgClient(
+bot = TgClient(
     "bot",
     TELEGRAM_API,
     TELEGRAM_HASH,
     bot_token=BOT_TOKEN,
-    workers=1000,
     parse_mode=enums.ParseMode.HTML,
     max_concurrent_transmissions=10,
 ).start()
-bot_loop = bot.loop
 bot_name = bot.me.username
 
 scheduler = AsyncIOScheduler(timezone=str(get_localzone()), event_loop=bot_loop)
 
-if not qbit_options:
-    qbit_options = dict(get_qb_client().app_preferences())
-    del qbit_options["listen_port"]
-    for k in list(qbit_options.keys()):
-        if k.startswith("rss"):
-            del qbit_options[k]
-else:
-    qb_opt = {**qbit_options}
-    for k, v in list(qb_opt.items()):
-        if v in ["", "*"]:
-            del qb_opt[k]
-    get_qb_client().app_set_preferences(qb_opt)
+
+def get_qb_options():
+    global qbit_options
+    if not qbit_options:
+        qbit_options = dict(qbittorrent_client.app_preferences())
+        del qbit_options["listen_port"]
+        for k in list(qbit_options.keys()):
+            if k.startswith("rss"):
+                del qbit_options[k]
+        qbittorrent_client.app_set_preferences({"web_ui_password": "mltbmltb"})
+    else:
+        qbit_options["web_ui_password"] = "mltbmltb"
+        qb_opt = {**qbit_options}
+        qbittorrent_client.app_set_preferences(qb_opt)
+
+
+get_qb_options()
 
 aria2 = ariaAPI(ariaClient(host="http://localhost", port=6800, secret=""))
 if not aria2_options:
@@ -511,3 +596,11 @@ if not aria2_options:
 else:
     a2c_glo = {op: aria2_options[op] for op in aria2c_global if op in aria2_options}
     aria2.set_global_options(a2c_glo)
+
+
+async def get_nzb_options():
+    global nzb_options
+    nzb_options = (await sabnzbd_client.get_config())["config"]["misc"]
+
+
+bot_loop.run_until_complete(get_nzb_options())

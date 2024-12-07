@@ -5,10 +5,10 @@ from os import walk, path as ospath, makedirs
 from re import split as re_split, I, search as re_search, escape
 from shutil import rmtree
 from subprocess import run as srun
-from sys import exit as sexit
+from sys import exit
 
-from bot import aria2, LOGGER, DOWNLOAD_DIR, get_qb_client
-from bot.helper.ext_utils.bot_utils import sync_to_async, cmd_exec
+from bot import aria2, LOGGER, DOWNLOAD_DIR, qbittorrent_client
+from .bot_utils import sync_to_async, cmd_exec
 from .exceptions import NotSupportedExtractionArchive
 
 ARCH_EXT = [
@@ -49,6 +49,8 @@ ARCH_EXT = [
     ".udf",
     ".vhd",
     ".xar",
+    ".zst",
+    ".cbz",
 ]
 
 FIRST_SPLIT_REGEX = r"(\.|_)part0*1\.rar$|(\.|_)7z\.0*1$|(\.|_)zip\.0*1$|^(?!.*(\.|_)part\d+\.rar$).*\.rar$"
@@ -73,7 +75,7 @@ async def clean_target(path):
         LOGGER.info(f"Cleaning Target: {path}")
         try:
             if await aiopath.isdir(path):
-                await aiormtree(path)
+                await aiormtree(path, ignore_errors=True)
             else:
                 await remove(path)
         except Exception as e:
@@ -84,16 +86,17 @@ async def clean_download(path):
     if await aiopath.exists(path):
         LOGGER.info(f"Cleaning Download: {path}")
         try:
-            await aiormtree(path)
+            await aiormtree(path, ignore_errors=True)
         except Exception as e:
             LOGGER.error(str(e))
 
 
 def clean_all():
     aria2.remove_all(True)
-    get_qb_client().torrents_delete(torrent_hashes="all")
+    qbittorrent_client.torrents_delete(torrent_hashes="all")
     try:
-        rmtree(DOWNLOAD_DIR)
+        LOGGER.info("Cleaning Download Directory")
+        rmtree(DOWNLOAD_DIR, ignore_errors=True)
     except:
         pass
     makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -104,13 +107,15 @@ def exit_clean_up(signal, frame):
         LOGGER.info("Please wait, while we clean up and stop the running downloads")
         clean_all()
         srun(["pkill", "-9", "-f", "gunicorn|aria2c|qbittorrent-nox|ffmpeg|java"])
-        sexit(0)
+        exit(0)
     except KeyboardInterrupt:
         LOGGER.warning("Force Exiting before the cleanup finishes!")
-        sexit(1)
+        exit(1)
 
 
-async def clean_unwanted(path, custom_list=[]):
+async def clean_unwanted(path, custom_list=None):
+    if custom_list is None:
+        custom_list = []
     LOGGER.info(f"Cleaning unwanted files/folders: {path}")
     for dirpath, _, files in await sync_to_async(walk, path, topdown=False):
         for filee in files:
@@ -123,7 +128,7 @@ async def clean_unwanted(path, custom_list=[]):
             ):
                 await remove(f_path)
         if dirpath.endswith((".unwanted", "splited_files_mltb", "copied_mltb")):
-            await aiormtree(dirpath)
+            await aiormtree(dirpath, ignore_errors=True)
     for dirpath, _, files in await sync_to_async(walk, path, topdown=False):
         if not await listdir(dirpath):
             await rmdir(dirpath)
@@ -140,7 +145,9 @@ async def get_path_size(path):
     return total_size
 
 
-async def count_files_and_folders(path, extension_filter, unwanted_files=[]):
+async def count_files_and_folders(path, extension_filter, unwanted_files=None):
+    if unwanted_files is None:
+        unwanted_files = []
     total_files = 0
     total_folders = 0
     for dirpath, dirs, files in await sync_to_async(walk, path):

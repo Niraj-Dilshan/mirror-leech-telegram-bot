@@ -1,4 +1,3 @@
-aiohttp
 aiofiles
 aioshutil
 anytree
@@ -20,9 +19,8 @@ motor
 natsort
 pillow
 psutil
-pycryptodome
 pymongo
-pyrogram
+pyrofork
 python-dotenv
 python-magic
 qbittorrent-api
@@ -33,4 +31,4 @@ tgcrypto
 urllib3
 uvloop
 xattr
-yt-dlp
+yt-dlp[default]
